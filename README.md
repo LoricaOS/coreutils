@@ -1,8 +1,8 @@
 # coreutils
 
-The unprivileged file / text / process utilities for **AspisOS**, a
+The unprivileged file / text / process utilities for **LoricaOS**, a
 capability-based, no-ambient-authority x86-64 operating system built on the
-from-scratch [Aegis](https://github.com/AspisOS/Aegis) kernel.
+from-scratch [Aegis](https://github.com/LoricaOS/Aegis) kernel.
 
 These are the leaf commands — `ls`, `cat`, `cp`, `grep`, `ps`, `find`, … — that
 make up the base userland. They hold **no capability policy and no privilege**:
@@ -37,4 +37,4 @@ VERSION       package version
 ```
 
 The OS consumes `coreutils.hpkg` as a fetched artifact and unpacks it into the
-base rootfs — see [AspisOS](https://github.com/AspisOS/AspisOS).
+base rootfs — see [LoricaOS](https://github.com/LoricaOS/LoricaOS).

@@ -1,4 +1,4 @@
-# coreutils — the unprivileged file/text/process utilities for AspisOS.
+# coreutils — the unprivileged file/text/process utilities for LoricaOS.
 #
 # Builds every util under src/<name>/ against musl, then packs a class=system
 # herald package that installs each binary at /bin/<name>. These are leaf
