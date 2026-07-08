@@ -1,78 +1,92 @@
-/* tail — print last N lines of a file (or stdin). Default N=10.
- * No -f. Ring buffer of last N lines, max line 4096, max ring 1024. */
-#include <unistd.h>
-#include <fcntl.h>
-#include <stdlib.h>
+/* tail — output the last part of files.  tail [-n N] [-c N] [-f] [FILE]
+ * -n last N lines (default 10), -c last N bytes, -f follow (poll for growth).
+ * No fixed line-length cap (the old version truncated at 4096). */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
-#define MAX_LINES 1024
-#define MAX_LINE  4096
-
-static int  s_n = 10;
-static char s_ring[MAX_LINES][MAX_LINE];
-static int  s_lens[MAX_LINES];
-static int  s_count;       /* number of lines stored (capped at s_n) */
-static int  s_head;        /* index of next slot to write */
+static long nlines = 10;
+static long nbytes = -1;      /* -1 = line mode */
+static int follow;
 
 static void
-push(const char *line, int len)
+tail_lines(FILE *f)
 {
-    if (len > MAX_LINE - 1) len = MAX_LINE - 1;
-    memcpy(s_ring[s_head], line, len);
-    s_lens[s_head] = len;
-    s_head = (s_head + 1) % s_n;
-    if (s_count < s_n) s_count++;
+    char **ring = calloc((size_t)nlines, sizeof *ring);
+    size_t head = 0, count = 0;
+    char *buf = NULL; size_t bcap = 0; ssize_t len;
+    while ((len = getline(&buf, &bcap, f)) != -1) {
+        free(ring[head]);
+        ring[head] = strndup(buf, (size_t)len);
+        head = (head + 1) % (size_t)nlines;
+        if (count < (size_t)nlines) count++;
+    }
+    free(buf);
+    size_t start = (head + (size_t)nlines - count) % (size_t)nlines;
+    for (size_t k = 0; k < count; k++) fputs(ring[(start + k) % (size_t)nlines], stdout);
+    for (size_t k = 0; k < (size_t)nlines; k++) free(ring[k]);
+    free(ring);
 }
 
 static void
-emit_all(void)
+tail_bytes(FILE *f)
 {
-    int start = (s_head + s_n - s_count) % s_n;
-    for (int k = 0; k < s_count; k++) {
-        int idx = (start + k) % s_n;
-        write(1, s_ring[idx], s_lens[idx]);
-        write(1, "\n", 1);
+    char *data = NULL; size_t cap = 0, n = 0;
+    for (;;) {
+        if (n == cap) { cap = cap ? cap * 2 : 65536; data = realloc(data, cap); }
+        size_t r = fread(data + n, 1, cap - n, f);
+        n += r;
+        if (!r) break;
     }
-}
-
-static void
-tail_fd(int fd)
-{
-    char line[MAX_LINE];
-    int len = 0;
-    char c;
-    while (read(fd, &c, 1) == 1) {
-        if (c == '\n') {
-            push(line, len);
-            len = 0;
-        } else if (len < MAX_LINE - 1) {
-            line[len++] = c;
-        }
-    }
-    if (len > 0) push(line, len);  /* trailing line w/o newline */
+    size_t off = (n > (size_t)nbytes) ? n - (size_t)nbytes : 0;
+    fwrite(data + off, 1, n - off, stdout);
+    free(data);
 }
 
 int
 main(int argc, char **argv)
 {
     int i = 1;
-    if (argc >= 3 && strcmp(argv[1], "-n") == 0) {
-        s_n = atoi(argv[2]);
-        if (s_n < 1)         s_n = 1;
-        if (s_n > MAX_LINES) s_n = MAX_LINES;
-        i = 3;
+    for (; i < argc; i++) {
+        char *a = argv[i];
+        if (a[0] != '-' || a[1] == '\0') break;
+        if (!strcmp(a, "--")) { i++; break; }
+        if (!strcmp(a, "-f") || !strcmp(a, "-F")) follow = 1;
+        else if (!strcmp(a, "-n")) { if (++i >= argc) return 1; nlines = atol(argv[i]); }
+        else if (!strncmp(a, "-n", 2)) nlines = atol(a + 2);
+        else if (!strcmp(a, "-c")) { if (++i >= argc) return 1; nbytes = atol(argv[i]); }
+        else if (!strncmp(a, "-c", 2)) nbytes = atol(a + 2);
+        else { fprintf(stderr, "tail: invalid option %s\n", a); return 1; }
     }
-    if (i >= argc) {
-        tail_fd(0);
-    } else {
-        for (; i < argc; i++) {
-            int fd = open(argv[i], 0);
-            if (fd < 0) { perror(argv[i]); return 1; }
-            tail_fd(fd);
-            close(fd);
+    if (nlines < 1) nlines = 1;
+
+    const char *path = (i < argc) ? argv[i] : NULL;
+    FILE *f = (path && strcmp(path, "-")) ? fopen(path, "r") : stdin;
+    if (!f) { perror(path); return 1; }
+
+    if (nbytes >= 0) tail_bytes(f);
+    else tail_lines(f);
+    fflush(stdout);
+
+    if (follow && f != stdin) {               /* poll the file for appended data */
+        long pos = ftell(f);
+        for (;;) {
+            struct timespec ts = { .tv_sec = 0, .tv_nsec = 400000000 };
+            nanosleep(&ts, NULL);
+            fseek(f, 0, SEEK_END);
+            long end = ftell(f);
+            if (end > pos) {
+                fseek(f, pos, SEEK_SET);
+                char b[8192]; size_t r;
+                while ((r = fread(b, 1, sizeof b, f)) > 0) fwrite(b, 1, r, stdout);
+                fflush(stdout);
+                pos = end;
+            } else {
+                clearerr(f);
+            }
         }
     }
-    emit_all();
+    if (f != stdin) fclose(f);
     return 0;
 }
