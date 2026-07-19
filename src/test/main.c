@@ -51,13 +51,23 @@ file_test(char op, const char *path)
 }
 
 /* Compare two files by mtime.  Returns 0 (true) if f1 is newer than f2
- * (-nt), or older (-ot).  If either file doesn't exist, the test is false. */
+ * (-nt), or older (-ot).  Follows bash semantics for a missing operand:
+ *   f1 -nt f2  is true if f1 exists and (f2 does not exist, or f1 is newer)
+ *   f1 -ot f2  is true if f2 exists and (f1 does not exist, or f1 is older)
+ * so the common `[ src -nt out ]` (out not yet built) correctly yields true. */
 static int
 age_test(const char *f1, const char *f2, int newer)
 {
     struct stat s1, s2;
-    if (stat(f1, &s1) != 0 || stat(f2, &s2) != 0)
-        return 1;   /* POSIX: nonexistent file makes the comparison false */
+    int e1 = stat(f1, &s1) == 0;
+    int e2 = stat(f2, &s2) == 0;
+    if (newer) {
+        if (!e1) return 1;   /* f1 missing -> never newer */
+        if (!e2) return 0;   /* f1 present, f2 missing -> newer */
+    } else {
+        if (!e2) return 1;   /* f2 missing -> f1 never older */
+        if (!e1) return 0;   /* f2 present, f1 missing -> older */
+    }
     if (s1.st_mtim.tv_sec == s2.st_mtim.tv_sec)
         return newer ? (s1.st_mtim.tv_nsec > s2.st_mtim.tv_nsec ? 0 : 1)
                      : (s1.st_mtim.tv_nsec < s2.st_mtim.tv_nsec ? 0 : 1);
@@ -75,9 +85,32 @@ eval_expr(char **argv, int fi, int la)
     int n = la - fi;
     if (n == 0) return 1;   /* empty: false */
 
-    /* ! expr — negate.  POSIX: ! has lowest precedence, so it consumes
-     * everything to its right.  `test ! -f x` => ! (-f x). */
-    if (n >= 1 && strcmp(argv[fi], "!") == 0) {
+    /* Binary combiners -a/-o have LOWER precedence than unary `!`, so they
+     * are split off first: `! X -a Y` must parse as `(!X) -a Y`, not
+     * `!(X -a Y)`.  Split on -o (lowest precedence) before -a.  We require a
+     * token on each side (i in [fi+1, la-2]) so a leading/trailing -a/-o is
+     * treated as a plain string operand instead of a dangling operator. */
+    if (n >= 3) {
+        for (int i = fi + 1; i < la - 1; i++) {
+            if (strcmp(argv[i], "-o") == 0) {
+                int r1 = eval_expr(argv, fi, i);
+                if (r1 == 2) return 2;
+                if (r1 == 0) return 0;             /* short-circuit true */
+                return eval_expr(argv, i + 1, la);
+            }
+        }
+        for (int i = fi + 1; i < la - 1; i++) {
+            if (strcmp(argv[i], "-a") == 0) {
+                int r1 = eval_expr(argv, fi, i);
+                if (r1 != 0) return r1 == 2 ? 2 : 1; /* short-circuit false/err */
+                return eval_expr(argv, i + 1, la);
+            }
+        }
+    }
+
+    /* ! expr — negate.  Any -a/-o has already been split above, so `!` here
+     * binds only to the primary that follows it (`test ! -f x` => !(-f x)). */
+    if (strcmp(argv[fi], "!") == 0) {
         int r = eval_expr(argv, fi + 1, la);
         if (r == 2) return 2;
         return r == 0 ? 1 : 0;
@@ -94,22 +127,9 @@ eval_expr(char **argv, int fi, int la)
         return file_test(op, argv[fi + 1]);
     }
 
-    /* Three-arg form: A OP B */
+    /* Three-arg form: A OP B (comparisons; -a/-o already handled above). */
     if (n == 3) {
         const char *a = argv[fi], *op = argv[fi + 1], *b = argv[fi + 2];
-
-        /* -a (and) / -o (or) in the middle combine two sub-expressions. */
-        if (strcmp(op, "-a") == 0) {
-            int r1 = eval_expr(argv, fi, fi + 1);
-            if (r1 != 0) return r1 == 2 ? 2 : 1;   /* short-circuit */
-            return eval_expr(argv, fi + 2, la);
-        }
-        if (strcmp(op, "-o") == 0) {
-            int r1 = eval_expr(argv, fi, fi + 1);
-            if (r1 == 0) return 0;   /* short-circuit true */
-            if (r1 == 2) return 2;
-            return eval_expr(argv, fi + 2, la);
-        }
 
         /* File age comparison. */
         if (strcmp(op, "-nt") == 0) return age_test(a, b, 1);
@@ -127,37 +147,6 @@ eval_expr(char **argv, int fi, int la)
         if (strcmp(op, "-le") == 0) return la_i <= lb_i ? 0 : 1;
         if (strcmp(op, "-gt") == 0) return la_i >  lb_i ? 0 : 1;
         if (strcmp(op, "-ge") == 0) return la_i >= lb_i ? 0 : 1;
-    }
-
-    /* Four-arg form: A OP B with a leading ! — `test ! -f x -a -d y`
-     * is 5 tokens but `test ! -f x` is 4.  Handle ! + 3-arg. */
-    if (n == 4 && strcmp(argv[fi], "!") == 0) {
-        int r = eval_expr(argv, fi + 1, la);
-        if (r == 2) return 2;
-        return r == 0 ? 1 : 0;
-    }
-
-    /* Longer expressions: split on -o (lowest precedence), then -a.  This is
-     * a simple left-to-right precedence that handles the common cases
-     * (test -f x -a -f y, test -f x -o -f y) without a full parser. */
-    if (n >= 5) {
-        /* Find the leftmost -o at this nesting level. */
-        for (int i = fi + 1; i < la - 1; i++) {
-            if (strcmp(argv[i], "-o") == 0) {
-                int r1 = eval_expr(argv, fi, i);
-                if (r1 == 0) return 0;
-                if (r1 == 2) return 2;
-                return eval_expr(argv, i + 1, la);
-            }
-        }
-        /* Find the leftmost -a. */
-        for (int i = fi + 1; i < la - 1; i++) {
-            if (strcmp(argv[i], "-a") == 0) {
-                int r1 = eval_expr(argv, fi, i);
-                if (r1 != 0) return r1 == 2 ? 2 : 1;   /* short-circuit */
-                return eval_expr(argv, i + 1, la);
-            }
-        }
     }
 
     dprintf(2, "test: unsupported expression\n");
